@@ -4,6 +4,18 @@ on:
   pull_request:
     paths:
       - 'submission/**'
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'submission/**'
+  workflow_dispatch:
+    inputs:
+      sample_size:
+        description: 'Number of words to sample'
+        required: false
+        default: '500'
 
 jobs:
   bench:
@@ -11,33 +23,72 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history needed so git diff can compare against base branch
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Detect changed solver files
+      - name: Resolve solver files to benchmark
         id: changed
         run: |
-          FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- 'submission/*.py' | head -5)
-          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR: only bench files changed in this PR
+            FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- 'submission/*.py' | grep -v '__init__' || true)
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Manual trigger: bench everything in submission/
+            FILES=$(find submission -maxdepth 1 -name '*.py' ! -name '__init__.py' | sort || true)
+          else
+            # Push to main/master: bench files changed in this push
+            FILES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} -- 'submission/*.py' | grep -v '__init__' || true)
+          fi
+          echo "Solver files to benchmark:"
+          echo "$FILES"
+          # Newline-separated list → space-separated for the next step
+          FILES_ONELINE=$(echo "$FILES" | tr '\n' ' ' | xargs)
+          echo "files=$FILES_ONELINE" >> "$GITHUB_OUTPUT"
 
       - name: Run Benchmark
         id: bench
+        if: steps.changed.outputs.files != ''
+        env:
+          SAMPLE: ${{ github.event.inputs.sample_size || '500' }}
         run: |
           set -e
           RESULTS=""
-          for FILE in ${{ steps.changed.outputs.files }}; do
-            echo "Benchmarking $FILE ..."
-            OUTPUT=$(python3 run_wordle.py --bench="$FILE" --sample=500 2>&1)
+          # Read files safely (no word-splitting on filenames with spaces)
+          read -ra FILE_ARRAY <<< "${{ steps.changed.outputs.files }}"
+          for FILE in "${FILE_ARRAY[@]}"; do
+            if [ ! -f "$FILE" ]; then
+              echo "File not found, skipping: $FILE"
+              continue
+            fi
+            echo "=== Benchmarking $FILE ==="
+            OUTPUT=$(python3 run_wordle.py --bench="$FILE" --sample="$SAMPLE" 2>&1)
+            EXIT_CODE=$?
             echo "$OUTPUT"
-            RESULTS="$RESULTS\n\n### $FILE\n\`\`\`\n$OUTPUT\n\`\`\`"
+            RESULTS="$RESULTS
+
+          ### $FILE
+          \`\`\`
+          $OUTPUT
+          \`\`\`"
+            if [ $EXIT_CODE -ne 0 ]; then
+              echo "::error::Benchmark failed for $FILE"
+            fi
           done
-          # Store for PR comment step
-          echo "results<<EOF" >> "$GITHUB_OUTPUT"
-          printf "%b" "$RESULTS" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          {
+            echo "results<<BENCH_EOF"
+            printf "%s" "$RESULTS"
+            echo "BENCH_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: No solvers changed
+        if: steps.changed.outputs.files == ''
+        run: echo "No solver files changed in submission/ — nothing to benchmark."
 
       - name: Save highscores artifact
         if: always()
@@ -45,34 +96,47 @@ jobs:
         with:
           name: highscores
           path: highscores.json
+          if-no-files-found: ignore
 
       - name: Comment on PR
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && steps.changed.outputs.files != ''
         uses: actions/github-script@v7
         with:
           script: |
             const results = `${{ steps.bench.outputs.results }}`;
-            github.rest.issues.createComment({
+            await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
               body: `## Benchmark Results\n${results}\n\n_Scores saved to \`highscores.json\` artifact._`
             });
 
-      - name: Fail if benchmark errored
+      - name: Fail if solver is broken
+        if: steps.changed.outputs.files != ''
         run: |
           python3 - <<'EOF'
-          import json, sys
+          import json, sys, os
+
+          if not os.path.exists("highscores.json"):
+              print("highscores.json not found — solver likely crashed before recording any score.")
+              sys.exit(1)
+
           with open("highscores.json") as f:
               scores = json.load(f)
+
           if not scores:
               print("No scores recorded — solver may have crashed.")
               sys.exit(1)
+
           latest = scores[-1]
-          print(f"Latest avg attempts: {latest['avg_attempts']}")
-          # Reject if solver averaged more than 15 guesses (likely broken)
-          if latest['avg_attempts'] > 15:
-              print("FAIL: avg_attempts too high (solver may not be working correctly)")
+          avg = latest.get("avg_attempts", 9999)
+          print(f"Solver:       {latest.get('solver', 'unknown')}")
+          print(f"Avg attempts: {avg}")
+          print(f"Avg score:    {latest.get('avg_score', 0)}")
+
+          if avg > 15:
+              print("FAIL: avg_attempts > 15 (solver is not working correctly)")
               sys.exit(1)
+
           print("PASS")
           EOF
