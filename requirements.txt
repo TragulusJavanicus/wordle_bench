@@ -1,0 +1,3 @@
+# No third-party dependencies required — all modules use Python stdlib.
+# Optional: install psutil for more accurate memory measurement.
+# psutil>=5.9

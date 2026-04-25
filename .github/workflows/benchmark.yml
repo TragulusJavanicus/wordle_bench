@@ -1,0 +1,78 @@
+name: Benchmark Solver
+
+on:
+  pull_request:
+    paths:
+      - 'submission/**'
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Detect changed solver files
+        id: changed
+        run: |
+          FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- 'submission/*.py' | head -5)
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+
+      - name: Run Benchmark
+        id: bench
+        run: |
+          set -e
+          RESULTS=""
+          for FILE in ${{ steps.changed.outputs.files }}; do
+            echo "Benchmarking $FILE ..."
+            OUTPUT=$(python3 run_wordle.py --bench="$FILE" --sample=500 2>&1)
+            echo "$OUTPUT"
+            RESULTS="$RESULTS\n\n### $FILE\n\`\`\`\n$OUTPUT\n\`\`\`"
+          done
+          # Store for PR comment step
+          echo "results<<EOF" >> "$GITHUB_OUTPUT"
+          printf "%b" "$RESULTS" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Save highscores artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: highscores
+          path: highscores.json
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const results = `${{ steps.bench.outputs.results }}`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Benchmark Results\n${results}\n\n_Scores saved to \`highscores.json\` artifact._`
+            });
+
+      - name: Fail if benchmark errored
+        run: |
+          python3 - <<'EOF'
+          import json, sys
+          with open("highscores.json") as f:
+              scores = json.load(f)
+          if not scores:
+              print("No scores recorded — solver may have crashed.")
+              sys.exit(1)
+          latest = scores[-1]
+          print(f"Latest avg attempts: {latest['avg_attempts']}")
+          # Reject if solver averaged more than 15 guesses (likely broken)
+          if latest['avg_attempts'] > 15:
+              print("FAIL: avg_attempts too high (solver may not be working correctly)")
+              sys.exit(1)
+          print("PASS")
+          EOF
