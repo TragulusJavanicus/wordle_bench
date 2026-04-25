@@ -8,8 +8,6 @@ on:
     branches:
       - main
       - master
-    paths:
-      - 'submission/**'
   workflow_dispatch:
     inputs:
       sample_size:
@@ -140,3 +138,27 @@ jobs:
 
           print("PASS")
           EOF
+
+  bench-all:
+    name: Full Algorithm Comparison
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run full benchmark (all built-in algorithms)
+        run: python run_wordle.py --bench=all --sample=1000
+
+      - name: Save highscores artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: highscores-all
+          path: highscores.json
+          if-no-files-found: ignore
